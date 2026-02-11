@@ -51,7 +51,6 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-
 def train_bpe(
             input_path: str, 
             vocab_size: int,
@@ -74,13 +73,15 @@ def train_bpe(
     
     merges = []
     num_merges = vocab_size - len(vocab)
+    # count pairs once, then maintain incrementally
+    pair_counts = count_pairs(pretokens)
     for _ in range(num_merges):
-        # count the frequency of each pair of tokens
-        pair_counts = count_pairs(pretokens)
+        if not pair_counts:
+            break
         # find the pair with the highest frequency
         top_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
-        # merge the pair
-        pretokens = merge_pretokens(pretokens, top_pair)
+        # merge the pair and update pair_counts incrementally
+        pretokens = merge_pretokens(pretokens, top_pair, pair_counts)
         # add the merged pair to the merges list
         merges.append(top_pair)
         # add the merged pair to the vocab
@@ -121,9 +122,9 @@ def process_chunk(file_path: str, start: int, end: int,
         chunk_bytes = f.read(end - start)
     
     try:
-        chunk_text = chunk_bytes.decode('utf-8')
+        chunk_text = chunk_bytes.decode('utf-8').replace('\r\n', '\n')
     except UnicodeDecodeError:
-        chunk_text = chunk_bytes.decode('utf-8', errors='ignore')
+        chunk_text = chunk_bytes.decode('utf-8', errors='ignore').replace('\r\n', '\n')
     
     if special_tokens:
         pattern = "|".join(re.escape(token) for token in special_tokens)
@@ -141,7 +142,6 @@ def process_chunk(file_path: str, start: int, end: int,
     
     return pretokens
 
-
 def count_pairs(pretokens: dict) -> dict:
     pair_counts = {}
     for token, count in pretokens.items():
@@ -150,10 +150,21 @@ def count_pairs(pretokens: dict) -> dict:
             pair_counts[pair] = pair_counts.get(pair, 0) + count
     return pair_counts
 
-def merge_pretokens(pretokens: dict, best_pair: tuple[bytes, bytes]) -> dict:
+def merge_pretokens(pretokens: dict, best_pair: tuple[bytes, bytes], pair_counts: dict) -> dict:
     new_pretokens = {}
     for token, count in pretokens.items():
         new_token = merge_tokens(token, best_pair)
+        if new_token != token:
+            # subtract old pair counts for this token
+            for i in range(len(token) - 1):
+                pair = (token[i], token[i+1])
+                pair_counts[pair] -= count
+                if pair_counts[pair] <= 0:
+                    del pair_counts[pair]
+            # add new pair counts for the merged token
+            for i in range(len(new_token) - 1):
+                pair = (new_token[i], new_token[i+1])
+                pair_counts[pair] = pair_counts.get(pair, 0) + count
         new_pretokens[new_token] = new_pretokens.get(new_token, 0) + count
     return new_pretokens
 
