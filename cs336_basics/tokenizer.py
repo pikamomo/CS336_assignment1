@@ -10,6 +10,7 @@ class Tokenizer:
         self.merges = merges
         self.special_tokens = set(special_tokens) if special_tokens is not None else set()
         self.vocab_reverse = {v: k for k, v in self.vocab.items()}
+        self.merge_priority = {merge: i for i, merge in enumerate(self.merges)}
 
     @classmethod
     def from_file(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
@@ -61,18 +62,36 @@ class Tokenizer:
         return "".join(decoded)
 
     def _apply_merges(self, word_bytes: tuple[bytes, bytes]) -> tuple[bytes, bytes]:
-        res = word_bytes
-        for merge in self.merges:
-            new_res = []
+        word_bytes = list(word_bytes)
+        while len(word_bytes) > 1:
+            # TODO 1: 找到当前token中所有可以merge的pairs及其位置
+            pairs = []  # [(priority, position, pair)]
+            for i in range(len(word_bytes) - 1):
+                pair = (word_bytes[i], word_bytes[i + 1])
+                if pair in self.merge_priority:
+                    priority = self.merge_priority[pair]
+                    pairs.append((priority, i, pair))
+            
+            # TODO 2: 如果没有可merge的pair，结束
+            if not pairs:
+                break
+            
+            # TODO 3: 找到优先级最高（priority最小）的pair
+            best_priority, best_pos, best_pair = min(pairs)
+            
+            # TODO 4: 执行merge
+            # 创建新的list，在best_pos处合并
+            new_word_bytes = []
             i = 0
-            while i < len(res) - 1:
-                if res[i:i+2] == merge:
-                    new_res.append(merge[0] + merge[1])
-                    i += 2
+            while i < len(word_bytes):
+                if i == best_pos:
+                    # 合并这两个bytes
+                    new_word_bytes.append(word_bytes[i] + word_bytes[i + 1])
+                    i += 2  # 跳过下一个
                 else:
-                    new_res.append(res[i])
+                    new_word_bytes.append(word_bytes[i])
                     i += 1
-            if i == len(res) - 1:
-                new_res.append(res[i])   
-            res = tuple(new_res)
-        return tuple(res)
+            
+            word_bytes = new_word_bytes
+        
+        return tuple(word_bytes)

@@ -2,8 +2,318 @@ import regex as re
 import multiprocessing as mp
 import os
 from typing import BinaryIO
+from collections import Counter, defaultdict
+import string
+import heapq
+import json
+from multiprocessing import Manager, Process, Queue
+from queue import Empty
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+NUM_PROCESSES = min(4, os.cpu_count() or 1)
+
+def train_bpe(
+    input_path: str | os.PathLike,
+    vocab_size: int,
+    special_tokens: list[str] | None = None    
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    num_merges = vocab_size - 256 - (len(special_tokens) if special_tokens else 0)
+    vocab: dict[int, bytes] = init_vocab(special_tokens)
+    merges: list[tuple[bytes, bytes]] = []
+
+    # 1. Pre-tokenization
+    # 1.1 Find chunk boundaries
+    with open(input_path, "rb") as f:
+        chunk_boundaries = find_chunk_boundaries(
+            f, desired_num_chunks=NUM_PROCESSES, split_special_token=b"\n"
+        )
+
+
+    # 1.2 Count word frequencies across chunks using multiprocessing
+    manager = Manager()
+    queue = manager.Queue()
+    processes: list[Process] = []
+
+    for start, end in zip(chunk_boundaries[:-1], chunk_boundaries[1:]):
+        p = Process(
+            target=pre_tokenize_string_worker,
+            args=(input_path, special_tokens, queue, start, end, False),
+        )
+        processes.append(p)
+        p.start()
+
+    for p in processes:
+        p.join()
+
+    word_counter = Counter()
+    for _ in range(len(processes)):
+        try:
+            partial_counter = queue.get(timeout=10)
+            word_counter.update(partial_counter)
+        except Empty:
+            continue
+
+    pairs_counter = Counter()
+    pair_to_words: dict[tuple[int, int], set[tuple[int, ...]]] = defaultdict(set)
+    for word in word_counter:
+        for i in range(len(word) - 1):
+            pair = (word[i], word[i + 1])
+            pair_to_words[pair].add(word)
+            pairs_counter[pair] += word_counter[word]
+
+    # 2. BPE Core Loop
+    pair_heap = build_pair_heap(pairs_counter, vocab)
+
+    for i in range(num_merges):
+        most_frequent_pair = pop_most_frequent_pair(pair_heap, pairs_counter)
+        new_id = update_vocab(vocab, most_frequent_pair)
+
+        word_counter, pairs_counter, pair_heap, pair_to_words = merge_pairs_with_heap_index(
+            word_counter, pairs_counter, most_frequent_pair, new_id, vocab, pair_heap, pair_to_words
+        )
+
+        merges.append((vocab[most_frequent_pair[0]], vocab[most_frequent_pair[1]]))
+
+
+    return vocab, merges
+
+def init_vocab(special_tokens: list[str] | None = None) -> dict[int, bytes]:
+    vocab: dict[int, bytes] = {x: bytes([x]) for x in range(256)}  # idx -> byte representation
+    current_index = 256
+
+    if special_tokens:
+        for token in special_tokens:
+            token_bytes = token.encode("utf-8")
+            vocab[current_index] = token_bytes
+            current_index += 1
+
+    return vocab
+
+def pair_counts(word_counter: dict[tuple[int, ...], int]) -> dict[tuple[int, int], int]:
+    pairs: dict[tuple[int, int], int] = {}
+
+    for word, count in word_counter.items():
+        for a, b in zip(word, word[1:]):
+            pairs[(a, b)] = pairs.get((a, b), 0) + count
+
+    return pairs
+
+def get_most_frequent_pair(
+    pair_counter: dict[tuple[int, int], int],
+) -> tuple[int, int]:
+    max_freq = max(pair_counter.values())
+    candidates = [pair for pair, freq in pair_counter.items() if freq == max_freq]
+    res = max(candidates)
+
+    return res
+
+def add_pair_to_vocab(
+    vocab: dict[int, bytes],
+    pair: tuple[int, int],
+) -> int:
+    index1, index2 = pair
+    vocab[len(vocab)] = vocab[index1] + vocab[index2]
+    return len(vocab) - 1
+
+def merge_pair_ids(
+    word_counter: dict[tuple[bytes] | tuple[int], int],
+    pair: tuple[int, int],
+    new_id: int,
+) -> tuple[dict[tuple[int], int], dict[tuple[int, int], int]]:
+    new_word_counter: defaultdict[tuple[int], int] = defaultdict(int)
+    updated_pair_counts: defaultdict[tuple[int, int], int] = defaultdict(int)
+
+    for token, freq in word_counter.items():
+        new_token = []
+        i = 0
+        L = len(token)
+
+        while i < L:
+            if i + 1 < L and (token[i], token[i + 1]) == pair:
+                new_token.append(new_id)
+                i += 2
+            else:
+                new_token.append(token[i])
+                i += 1
+
+        new_word_counter[tuple(new_token)] += freq
+
+        for index1, index2 in zip(new_token[:-1], new_token[1:]):
+            updated_pair_counts[(index1, index2)] += freq
+
+    return dict(new_word_counter), dict(updated_pair_counts)    
+
+def string_to_bytes(text: str, return_int: bool = False):
+    text_bytes = text.encode("utf-8")
+    if return_int:
+        return [b for b in text_bytes]
+    return text_bytes
+
+def split_by_special_tokens(text: str, special_tokens: list[str], include_special: bool = False) -> list[str]:
+    if not special_tokens:
+        return [text]
+
+    special_tokens_sorted = sorted(special_tokens, key=len, reverse=True)
+    pattern = "|".join(re.escape(t) for t in special_tokens_sorted)
+
+    if include_special:
+        special_chunks = re.split(f"({pattern})", text)
+    else:
+        # Split without capturing the special tokens
+        special_chunks = re.split(pattern, text)
+
+    return special_chunks
+
+def pre_tokenize(string: str, special_tokens: list[str], including_special: bool = False) -> Counter:
+    word_counter = Counter()
+
+    chunks = split_by_special_tokens(string, special_tokens, include_special=including_special)
+
+    for chunk in chunks:
+        if including_special and chunk in special_tokens:
+            word_counter[tuple(string_to_bytes(chunk))] += 1
+        else:
+            for match in re.finditer(PAT, chunk):
+                word = match.group(0)
+                word_encoded = tuple(string_to_bytes(word, return_int=True))
+                word_counter[word_encoded] += 1
+
+    return word_counter
+
+def pre_tokenize_string_worker(*args):
+    input_path, special_tokens, queue, start, end, include_special = args
+
+    # Read the chunk from the file
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+    
+    # Normalize line endings
+    chunk = chunk.replace('\r\n', '\n').replace('\r', '\n')
+
+    word_counter = pre_tokenize(chunk, special_tokens, include_special)
+
+    # Put the result in the queue
+    queue.put(word_counter)
+
+class HeapItem:
+    def __init__(self, neg_freq: int, pair_bytes: tuple[bytes, bytes], pair: tuple[int, int]):
+        self.neg_freq = neg_freq
+        self.pair_bytes = pair_bytes
+        self.pair = pair
+
+    def __lt__(self, other: "HeapItem") -> bool:
+        if self.neg_freq != other.neg_freq:
+            return self.neg_freq < other.neg_freq
+        return self.pair_bytes > other.pair_bytes  # tie-break by lexicographic order
+
+
+def build_pair_heap(pairs_freqs: Counter, vocab: dict[int, bytes]):
+    heap = []
+    for (a, b), f in pairs_freqs.items():
+        if f > 0:
+            item = HeapItem(-f, (vocab[a], vocab[b]), (a, b))
+            heapq.heappush(heap, item)
+    return heap
+
+
+def pop_most_frequent_pair(heap, pairs_counter: Counter) -> tuple[int, int]:
+    while heap:
+        item = heapq.heappop(heap)  # Pop the top item
+        neg_f = item.neg_freq
+        pair = item.pair
+        cur_f = pairs_counter.get(pair, 0)
+        if cur_f <= 0 or -neg_f != cur_f:  # frequency changed, which means the pair we store in heap is stale
+            continue
+        return pair
+
+    raise ValueError("No positive-frequency pairs remain")
+
+
+def merge_pairs_with_heap_index(
+    word_counter: dict[tuple[int, ...], int],
+    pair_counter: Counter,
+    target_pair: tuple[int, int],
+    new_id: int,
+    vocab: dict[int, bytes],
+    pair_heap,
+    pair_to_words: dict[tuple[int, int], set[tuple[int, ...]]],
+) -> tuple[
+    dict[tuple[int, ...], int],
+    Counter,
+    list,
+    dict[tuple[int, int], set[tuple[int, ...]]],
+]:
+    # Start from full counters so unaffected words remain.
+    new_word_counter: Counter = Counter(word_counter)
+    updated_pair_counter: Counter = pair_counter.copy()
+    changed_pairs: set[tuple[int, int]] = set()
+
+    # Get all words that contain the target pair.
+    affected_words = list(pair_to_words.get(target_pair, set()))
+
+    for w in affected_words:
+        freq = word_counter.get(w, 0)
+        if freq <= 0 or len(w) < 2:
+            continue
+
+        # 1. Remove the old word from the corpus counts.
+        new_word_counter[w] -= freq
+        if new_word_counter[w] <= 0:
+            del new_word_counter[w]
+
+        # 2. Subtract ALL old adjacent pairs for this word + remove old word from index.
+        for i in range(len(w) - 1):
+            pair = (w[i], w[i + 1])
+            updated_pair_counter[pair] -= freq
+            changed_pairs.add(pair)
+
+            s = pair_to_words.get(pair)
+            if s is not None:
+                s.discard(w)
+                if not s:
+                    del pair_to_words[pair]
+
+        # 3. Build merged word (greedy left-to-right, same as standard BPE).
+        new_word = get_new_word(w, target_pair, new_id)
+        new_word_counter[new_word] += freq
+
+        # 4. Add ALL new adjacent pairs for merged word + add merged word into index.
+        if len(new_word) >= 2:
+            for i in range(len(new_word) - 1):
+                pair = (new_word[i], new_word[i + 1])
+                updated_pair_counter[pair] += freq
+                changed_pairs.add(pair)
+                pair_to_words.setdefault(pair, set()).add(new_word)
+
+    # 5. Push updated frequencies for changed pairs into heap (skip non-positive).
+    if pair_heap is not None:
+        for p in changed_pairs:
+            f = updated_pair_counter.get(p, 0)
+            if f > 0:
+                heapq.heappush(pair_heap, HeapItem(-f, (vocab[p[0]], vocab[p[1]]), p))
+
+    return dict(new_word_counter), updated_pair_counter, pair_heap, pair_to_words
+
+def get_new_word(
+    word: tuple[int, ...],
+    target_pair: tuple[int, int],
+    new_id: int,
+) -> tuple[int, ...]:
+    a, b = target_pair
+    new_word = []
+    i = 0
+
+    while i < len(word):
+        if i + 1 < len(word) and word[i] == a and word[i + 1] == b:
+            new_word.append(new_id)
+            i += 2
+        else:
+            new_word.append(word[i])
+            i += 1
+
+    return tuple(new_word)
+
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -51,136 +361,7 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-def train_bpe(
-            input_path: str, 
-            vocab_size: int,
-            special_tokens: list[str]
-            ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """
-    Train a BPE tokenizer on the input text.
-    """
-    # initialize the vocab
-    vocab = {}
-    for i in range(256):
-        vocab[i] = bytes([i])
-    idx = len(vocab)
-    for token in special_tokens:
-        vocab[idx] = token.encode('utf-8')
-        idx += 1
-
-    # pre-tokenize the input text
-    pretokens = pretokenize_parallel(input_path, special_tokens, num_processes=4)
-    
-    merges = []
-    num_merges = vocab_size - len(vocab)
-    # count pairs once, then maintain incrementally
-    pair_counts = count_pairs(pretokens)
-    for _ in range(num_merges):
-        if not pair_counts:
-            break
-        # find the pair with the highest frequency
-        top_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
-        # merge the pair and update pair_counts incrementally
-        pretokens = merge_pretokens(pretokens, top_pair, pair_counts)
-        # add the merged pair to the merges list
-        merges.append(top_pair)
-        # add the merged pair to the vocab
-        vocab[idx] = top_pair[0] + top_pair[1]
-        idx += 1
-    return vocab, merges
-
-def pretokenize_parallel(input_path: str, special_tokens: list[str], 
-                        num_processes: int = 8) -> dict:
-    
-    with open(input_path, "rb") as f:
-        boundaries = find_chunk_boundaries(f, num_processes, "<|endoftext|>".encode("utf-8"))
-    
-    tasks = []
-    for i in range(len(boundaries) - 1):
-        start = boundaries[i]
-        end = boundaries[i + 1]
-        tasks.append((input_path, start, end, special_tokens))
-    
-    with mp.Pool(num_processes) as pool:
-        results = pool.starmap(process_chunk, tasks)
-    
-    pretokens = {}
-    for chunk_pretokens in results:
-        for token, count in chunk_pretokens.items():
-            if token in pretokens:
-                pretokens[token] += count
-            else:
-                pretokens[token] = count
-    
-    return pretokens
-
-def process_chunk(file_path: str, start: int, end: int, 
-                 special_tokens: list[str]) -> dict:
-
-    with open(file_path, "rb") as f:
-        f.seek(start)
-        chunk_bytes = f.read(end - start)
-    
-    try:
-        chunk_text = chunk_bytes.decode('utf-8').replace('\r\n', '\n')
-    except UnicodeDecodeError:
-        chunk_text = chunk_bytes.decode('utf-8', errors='ignore').replace('\r\n', '\n')
-    
-    if special_tokens:
-        pattern = "|".join(re.escape(token) for token in special_tokens)
-        text_parts = [part for part in re.split(pattern, chunk_text) if part]
-    else:
-        text_parts = [chunk_text]
-    
-    pretokens = {}
-    for part in text_parts:
-        for match in re.finditer(PAT, part):
-            word = match.group()
-            word_bytes = word.encode('utf-8')
-            word_tuple = tuple(bytes([b]) for b in word_bytes)
-            pretokens[word_tuple] = pretokens.get(word_tuple, 0) + 1
-    
-    return pretokens
-
-def count_pairs(pretokens: dict) -> dict:
-    pair_counts = {}
-    for token, count in pretokens.items():
-        for i in range(len(token) - 1):
-            pair = tuple([token[i], token[i+1]])
-            pair_counts[pair] = pair_counts.get(pair, 0) + count
-    return pair_counts
-
-def merge_pretokens(pretokens: dict, best_pair: tuple[bytes, bytes], pair_counts: dict) -> dict:
-    new_pretokens = {}
-    for token, count in pretokens.items():
-        new_token = merge_tokens(token, best_pair)
-        if new_token != token:
-            # subtract old pair counts for this token
-            for i in range(len(token) - 1):
-                pair = (token[i], token[i+1])
-                pair_counts[pair] -= count
-                if pair_counts[pair] <= 0:
-                    del pair_counts[pair]
-            # add new pair counts for the merged token
-            for i in range(len(new_token) - 1):
-                pair = (new_token[i], new_token[i+1])
-                pair_counts[pair] = pair_counts.get(pair, 0) + count
-        new_pretokens[new_token] = new_pretokens.get(new_token, 0) + count
-    return new_pretokens
-
-def merge_tokens(token: tuple[bytes, bytes], best_pair: tuple[bytes, bytes]) -> tuple[bytes, bytes]:
-    if len(token) < 2:
-        return token
-    
-    new_token = []
-    i = 0
-    while i < len(token) - 1:
-        if token[i:i+2] == best_pair:
-            new_token.append(token[i] + token[i+1])
-            i += 2
-        else:
-            new_token.append(token[i])
-            i += 1
-    if i == len(token) - 1:
-        new_token.append(token[i])
-    return tuple(new_token)
+def update_vocab(vocab: dict[int, bytes], pair: tuple[int, int]) -> int:
+    new_id = len(vocab)
+    vocab[new_id] = vocab[pair[0]] + vocab[pair[1]]
+    return new_id
