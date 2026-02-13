@@ -21,15 +21,15 @@ def train_bpe(
     vocab: dict[int, bytes] = init_vocab(special_tokens)
     merges: list[tuple[bytes, bytes]] = []
 
-    # 1. Pre-tokenization
-    # 1.1 Find chunk boundaries
+    #  Pre-tokenization
+    #  Find chunk boundaries
     with open(input_path, "rb") as f:
         chunk_boundaries = find_chunk_boundaries(
             f, desired_num_chunks=NUM_PROCESSES, split_special_token=b"\n"
         )
 
 
-    # 1.2 Count word frequencies across chunks using multiprocessing
+    #  Count word frequencies across chunks using multiprocessing
     manager = Manager()
     queue = manager.Queue()
     processes: list[Process] = []
@@ -60,8 +60,18 @@ def train_bpe(
             pair = (word[i], word[i + 1])
             pair_to_words[pair].add(word)
             pairs_counter[pair] += word_counter[word]
-
-    # 2. BPE Core Loop
+    """
+    word_counter is like:
+    {(104, 101, 201, 1, 2)): number of times}
+    The tuple is the byte representation of the word.
+    pairs_counter is like:
+    {(104, 101): number of times}
+    pair_to_words is like:
+    {(104, 101): {(104, 101, 201, 1, 2)}}
+    vocab is like:
+    {0: b'a'}
+    """
+    # BPE Core Loop
     pair_heap = build_pair_heap(pairs_counter, vocab)
 
     for i in range(num_merges):
@@ -257,12 +267,12 @@ def merge_pairs_with_heap_index(
         if freq <= 0 or len(w) < 2:
             continue
 
-        # 1. Remove the old word from the corpus counts.
+        # Remove the old word from the corpus counts.
         new_word_counter[w] -= freq
         if new_word_counter[w] <= 0:
             del new_word_counter[w]
 
-        # 2. Subtract ALL old adjacent pairs for this word + remove old word from index.
+        # Subtract ALL old adjacent pairs for this word + remove old word from index.
         for i in range(len(w) - 1):
             pair = (w[i], w[i + 1])
             updated_pair_counter[pair] -= freq
@@ -274,11 +284,11 @@ def merge_pairs_with_heap_index(
                 if not s:
                     del pair_to_words[pair]
 
-        # 3. Build merged word (greedy left-to-right, same as standard BPE).
+        # Build merged word (greedy left-to-right, same as standard BPE).
         new_word = get_new_word(w, target_pair, new_id)
         new_word_counter[new_word] += freq
 
-        # 4. Add ALL new adjacent pairs for merged word + add merged word into index.
+        # Add ALL new adjacent pairs for merged word + add merged word into index.
         if len(new_word) >= 2:
             for i in range(len(new_word) - 1):
                 pair = (new_word[i], new_word[i + 1])
@@ -286,7 +296,7 @@ def merge_pairs_with_heap_index(
                 changed_pairs.add(pair)
                 pair_to_words.setdefault(pair, set()).add(new_word)
 
-    # 5. Push updated frequencies for changed pairs into heap (skip non-positive).
+    # Push updated frequencies for changed pairs into heap (skip non-positive).
     if pair_heap is not None:
         for p in changed_pairs:
             f = updated_pair_counter.get(p, 0)
