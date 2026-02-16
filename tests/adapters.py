@@ -194,7 +194,7 @@ def run_multihead_self_attention_with_rope(
         implementation with the given QKV projection weights and input features.
     """
     from cs336_basics.modules.attention import MultiheadAttention
-    mha = MultiheadAttention(d_model=d_model, num_heads=num_heads, theta=theta, max_seq_len=max_seq_len, use_rope=True)
+    mha = MultiheadAttention(d_model=d_model, num_heads=num_heads, theta=theta, max_seq_len=max_seq_len)
     mha.q_linear.weight.data = q_proj_weight
     mha.k_linear.weight.data = k_proj_weight
     mha.v_linear.weight.data = v_proj_weight
@@ -296,7 +296,27 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    from cs336_basics.modules.transformer_block import TransformerBlock
+    from cs336_basics.modules.Config import ModelConfig
+    config = ModelConfig(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,
+        rope_theta=theta,
+        use_rope=True,
+    )
+    transformer_block = TransformerBlock(config)
+    transformer_block.mha.q_linear.weight.data = weights['attn.q_proj.weight']
+    transformer_block.mha.k_linear.weight.data = weights['attn.k_proj.weight']
+    transformer_block.mha.v_linear.weight.data = weights['attn.v_proj.weight']
+    transformer_block.mha.o_linear.weight.data = weights['attn.output_proj.weight']
+    transformer_block.norm1.weight.data = weights['ln1.weight']
+    transformer_block.ffn.up.weight.data = weights['ffn.w1.weight']
+    transformer_block.ffn.down.weight.data = weights['ffn.w2.weight']
+    transformer_block.ffn.gate.weight.data = weights['ffn.w3.weight']
+    transformer_block.norm2.weight.data = weights['ln2.weight']
+    return transformer_block(in_features, token_positions=None)
 
 
 def run_transformer_lm(
