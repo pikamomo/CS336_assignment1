@@ -15,8 +15,8 @@ class Embedding(nn.Module):
         self.weight = nn.Parameter(torch.empty((num_embeddings, embedding_dim), device=device, dtype=dtype))
         self._init_weight()
 
-        def _init_weight(self):
-            torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=1, a=-3, b=3)
+    def _init_weight(self):
+        torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=1, a=-3, b=3)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L = x.shape  # x: (B, L)
