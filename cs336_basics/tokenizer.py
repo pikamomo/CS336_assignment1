@@ -188,6 +188,6 @@ def load_tokenizer_from_dir(dir_path: str) -> Tokenizer:
     vocab_path = os.path.join(dir_path, "vocab.json")
     merges_path = os.path.join(dir_path, "merges.txt")
     special_tokens_path = os.path.join(dir_path, "special_tokens.txt")
-    tokenizer = Tokenizer.from_files(vocab_path, merges_path, special_tokens_path)
+    tokenizer = Tokenizer.from_file(vocab_path, merges_path, special_tokens_path)
     return tokenizer
 
