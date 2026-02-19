@@ -1,4 +1,4 @@
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, field
 from typing import Any, Mapping
 import json
 from pathlib import Path
@@ -59,3 +59,34 @@ class ModelConfig:
         path = Path(path)
         with path.open("w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, ensure_ascii=False, indent=indent)
+
+
+
+@dataclass
+class TrainingConfig:
+    batch_size: int = 256
+    num_steps: int = 10_000
+    dataset_dir: str = "datasets/tiny_stories"
+    train_data_path: str = "datasets/tiny_stories/train.bin"
+    eval_data_path: str = "datasets/tiny_stories/eval.bin"
+
+    # Optimizer related parameters
+    betas: tuple = field(default=(0.9, 0.98))
+    weight_decay: float = 1e-5
+    max_lr: float = 3e-4
+    min_lr: float = 1e-5
+    warmup_steps: int = 500
+    max_grad_norm: float = 1.0
+
+    # Logging & checkpointing
+    wandb_logging: bool = True
+    eval_log_interval: int = 500
+    sampling_log_interval: int = 200
+
+    # Others:
+    model_name: str = "tiny_stories_transformer"
+    save_checkpoint_dir: str = "checkpoints"
+    device: str = "cpu"
+    debug_mode: bool = False
+    use_mixed_precision: bool = True
+    seed: int = 2025
