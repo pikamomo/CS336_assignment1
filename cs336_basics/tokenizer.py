@@ -2,6 +2,7 @@ import json
 from typing import Iterable
 import regex as re
 import heapq
+import os
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -181,3 +182,12 @@ class Tokenizer:
             special_chunks = re.split(pattern, text)
 
         return special_chunks
+
+
+def load_tokenizer_from_dir(dir_path: str) -> Tokenizer:
+    vocab_path = os.path.join(dir_path, "vocab.json")
+    merges_path = os.path.join(dir_path, "merges.txt")
+    special_tokens_path = os.path.join(dir_path, "special_tokens.txt")
+    tokenizer = Tokenizer.from_files(vocab_path, merges_path, special_tokens_path)
+    return tokenizer
+
